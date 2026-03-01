@@ -8,12 +8,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download NDK
+      - name: Download NDK with curl
         run: |
-          wget -O android-ndk-r17c-linux-x86_64.zip \
-          https://dl.google.com/android/repository/android-ndk-r17c-linux-x86_64.zip
+          curl -L \
+            -o android-ndk-r17c-linux-x86_64.zip \
+            https://dl.google.com/android/repository/android-ndk-r17c-linux-x86_64.zip
 
-      - name: Create Release
+      - name: Create Release and Upload
         uses: ncipollo/release-action@v1
         with:
           tag: "ndk-r17c-${{ github.run_number }}"
