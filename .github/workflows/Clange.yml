@@ -20,6 +20,8 @@ jobs:
             -x 16 \
             -s 16 \
             -k 1M \
+            --summary-interval=1 \
+            --console-log-level=notice \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r563880c.tar.gz \
             -o clang-r563880c.tar.gz
 
