@@ -86,9 +86,11 @@ jobs:
 
       - name: 🛫 Pre-flight
         id: preflight
+        env:
+          RAW_INPUT: ${{ inputs.repo_url }}
+          CLONE_DEPTH: ${{ inputs.clone_depth }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          RAW_INPUT="${{ inputs.repo_url }}"
-
           # ── Parse URL and optional -b <branch> from the input ──────────────
           # Supports:  https://...repo.git
           #            https://...repo.git -b branchname
@@ -105,10 +107,17 @@ jobs:
             exit 1
           fi
 
+          # ── Reject branch names that could break out of the git argument
+          #     or carry shell metacharacters into a later step's script text ──
+          if [[ -n "$BRANCH" && ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Branch name contains disallowed characters: $BRANCH"
+            exit 1
+          fi
+
           # ── Derive clean identifiers ────────────────────────────────────────
           REPO_NAME=$(basename "$REPO_URL" .git)
           SAFE_NAME=$(echo "$REPO_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
-          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="repo_${{ github.run_number }}"
+          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="repo_${RUN_NUMBER}"
 
           # Include branch in archive name to avoid collisions
           SAFE_BRANCH=""
@@ -125,8 +134,7 @@ jobs:
           RELEASE_NAME="🗄️ ${SAFE_NAME} (${BRANCH_LABEL}) — git snapshot ${TIMESTAMP}"
 
           DEPTH_LABEL="full history"
-          [[ "${{ inputs.clone_depth }}" != "0" ]] && \
-            DEPTH_LABEL="depth ${{ inputs.clone_depth }}"
+          [[ "$CLONE_DEPTH" != "0" ]] && DEPTH_LABEL="depth ${CLONE_DEPTH}"
 
           {
             echo "repo_url=$REPO_URL"
@@ -151,13 +159,14 @@ jobs:
 
       - name: 📥 Clone repository
         id: clone
+        env:
+          SAFE_NAME: ${{ steps.preflight.outputs.safe_name }}
+          REPO_URL: ${{ steps.preflight.outputs.repo_url }}
+          BRANCH: ${{ steps.preflight.outputs.branch }}
+          DEPTH: ${{ inputs.clone_depth }}
         run: |
           echo "::group::git clone"
-          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
-          REPO_URL="${{ steps.preflight.outputs.repo_url }}"
-          BRANCH="${{ steps.preflight.outputs.branch }}"
           CLONE_DIR="$WORK_DIR/$SAFE_NAME"
-          DEPTH="${{ inputs.clone_depth }}"
 
           GIT_FLAGS=(--progress)
           [[ "$DEPTH" != "0" ]] && GIT_FLAGS+=(--depth "$DEPTH")
@@ -190,10 +199,10 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
 
       - name: 🗑️ Strip working tree — keep .git only
+        env:
+          CLONE_DIR: ${{ steps.clone.outputs.clone_dir }}
         run: |
           echo "::group::Stripping working tree"
-          CLONE_DIR="${{ steps.clone.outputs.clone_dir }}"
-
           BEFORE=$(find "$CLONE_DIR" | wc -l)
 
           # Delete everything that is NOT the .git directory itself
@@ -219,21 +228,27 @@ jobs:
 
       - name: 🗜️ Compress .git directory
         id: compress
+        env:
+          SAFE_NAME: ${{ steps.preflight.outputs.safe_name }}
+          ARCHIVE_BASE: ${{ steps.preflight.outputs.archive_base }}
+          CLONE_DIR: ${{ steps.clone.outputs.clone_dir }}
+          FORMAT: ${{ inputs.compress_format }}
         run: |
           echo "::group::Compression"
-          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
-          ARCHIVE_BASE="${{ steps.preflight.outputs.archive_base }}"
-          CLONE_DIR="${{ steps.clone.outputs.clone_dir }}"
-          FORMAT="${{ inputs.compress_format }}"
           ORIG_BYTES=$(du -sb "$CLONE_DIR/.git" | cut -f1)
 
           START=$(date +%s)
 
           case "$FORMAT" in
             zst)
+              if   (( ORIG_BYTES > 5368709120 )); then ZSTD_LEVEL=9    # >5 GiB
+              elif (( ORIG_BYTES > 1073741824 )); then ZSTD_LEVEL=15   # >1 GiB
+              else ZSTD_LEVEL=19
+              fi
+              echo "→ zstd level: $ZSTD_LEVEL (based on $(numfmt --to=iec $ORIG_BYTES))"
               ARCHIVE="$WORK_DIR/${ARCHIVE_BASE}.git.tar.zst"
               tar -cf - -C "$CLONE_DIR" .git \
-                | zstd -19 --threads=0 --long=31 -o "$ARCHIVE"
+                | zstd "-$ZSTD_LEVEL" --threads=0 --long=31 -o "$ARCHIVE"
               ;;
             tar.gz)
               ARCHIVE="$WORK_DIR/${ARCHIVE_BASE}.git.tar.gz"
@@ -274,12 +289,13 @@ jobs:
 
       - name: ✂️ Size check & split if needed
         id: split
+        env:
+          ARCHIVE: ${{ steps.compress.outputs.archive }}
+          ARCHIVE_NAME: ${{ steps.compress.outputs.archive_name }}
+          ARCHIVE_BYTES: ${{ steps.compress.outputs.archive_bytes }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           echo "::group::Size check & split"
-          ARCHIVE="${{ steps.compress.outputs.archive }}"
-          ARCHIVE_NAME="${{ steps.compress.outputs.archive_name }}"
-          ARCHIVE_BYTES="${{ steps.compress.outputs.archive_bytes }}"
-          SPLIT_SIZE="${{ inputs.split_size }}"
           DID_SPLIT=false
           PART_COUNT=1
 
@@ -332,14 +348,26 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
 
       - name: 📝 Generate release notes
+        env:
+          ARCHIVE_NAME: ${{ steps.compress.outputs.archive_name }}
+          DID_SPLIT: ${{ steps.split.outputs.split }}
+          PART_COUNT: ${{ steps.split.outputs.part_count }}
+          RELEASE_NAME: ${{ steps.preflight.outputs.release_name }}
+          REPO_URL: ${{ steps.preflight.outputs.repo_url }}
+          BRANCH_LABEL: ${{ steps.preflight.outputs.branch_label }}
+          DEPTH_LABEL: ${{ steps.preflight.outputs.depth_label }}
+          CLONE_SIZE: ${{ steps.clone.outputs.clone_size }}
+          GIT_SIZE: ${{ steps.clone.outputs.git_size }}
+          FORMAT: ${{ inputs.compress_format }}
+          RATIO: ${{ steps.compress.outputs.ratio }}
+          ARCHIVE_SIZE: ${{ steps.compress.outputs.archive_size }}
+          CLONE_ELAPSED: ${{ steps.clone.outputs.elapsed }}
+          COMPRESS_ELAPSED: ${{ steps.compress.outputs.elapsed }}
         run: |
-          ARCHIVE_NAME="${{ steps.compress.outputs.archive_name }}"
-          DID_SPLIT="${{ steps.split.outputs.split }}"
-          PART_COUNT="${{ steps.split.outputs.part_count }}"
           CHECKSUMS=$(cat "$PARTS_DIR/SHA256SUMS.txt")
 
           cat > release_notes.md << NOTES
-          ## 🗄️ ${{ steps.preflight.outputs.release_name }}
+          ## 🗄️ ${RELEASE_NAME}
 
           > This release contains a compressed **bare `.git` snapshot** of the repository.
           > You can restore a full working copy with \`git clone\` from the archive.
@@ -347,26 +375,26 @@ jobs:
           ### 🔗 Source
           | Field | Value |
           |-------|-------|
-          | Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
-          | Branch | \`${{ steps.preflight.outputs.branch_label }}\` |
-          | Clone depth | ${{ steps.preflight.outputs.depth_label }} |
-          | Clone size | ${{ steps.clone.outputs.clone_size }} |
-          | .git size (raw) | ${{ steps.clone.outputs.git_size }} |
+          | Repository | \`${REPO_URL}\` |
+          | Branch | \`${BRANCH_LABEL}\` |
+          | Clone depth | ${DEPTH_LABEL} |
+          | Clone size | ${CLONE_SIZE} |
+          | .git size (raw) | ${GIT_SIZE} |
 
           ### ⚙️ Processing
           | Step | Result |
           |------|--------|
-          | Format | \`${{ inputs.compress_format }}\` |
-          | Compression level | 19 (maximum) |
-          | Space saved | ${{ steps.compress.outputs.ratio }} |
-          | Final archive | \`${ARCHIVE_NAME}\` (${{ steps.compress.outputs.archive_size }}) |
+          | Format | \`${FORMAT}\` |
+          | Compression level | adaptive (see job log) |
+          | Space saved | ${RATIO} |
+          | Final archive | \`${ARCHIVE_NAME}\` (${ARCHIVE_SIZE}) |
           | Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
 
           ### 🏗️ Build Info
           | Field | Value |
           |-------|-------|
-          | Clone time | ${{ steps.clone.outputs.elapsed }} |
-          | Compress time | ${{ steps.compress.outputs.elapsed }} |
+          | Clone time | ${CLONE_ELAPSED} |
+          | Compress time | ${COMPRESS_ELAPSED} |
           | Date | $(date -u +'%Y-%m-%d %H:%M UTC') |
           | Triggered by | @${{ github.actor }} |
           | Workflow run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
@@ -413,22 +441,34 @@ jobs:
 
       - name: 📊 Write job summary
         if: always()
+        env:
+          REPO_URL: ${{ steps.preflight.outputs.repo_url }}
+          BRANCH_LABEL: ${{ steps.preflight.outputs.branch_label }}
+          DEPTH_LABEL: ${{ steps.preflight.outputs.depth_label }}
+          CLONE_SIZE: ${{ steps.clone.outputs.clone_size }}
+          GIT_SIZE: ${{ steps.clone.outputs.git_size }}
+          FORMAT: ${{ inputs.compress_format }}
+          RATIO: ${{ steps.compress.outputs.ratio }}
+          ARCHIVE_SIZE: ${{ steps.compress.outputs.archive_size }}
+          DID_SPLIT: ${{ steps.split.outputs.split }}
+          PART_COUNT: ${{ steps.split.outputs.part_count }}
+          TAG: ${{ steps.preflight.outputs.tag }}
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## 🗄️ Git Snapshot & Release
 
           | Field | Value |
           |-------|-------|
-          | 🔗 Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
-          | 🌿 Branch | ${{ steps.preflight.outputs.branch_label }} |
-          | 🔢 Clone depth | ${{ steps.preflight.outputs.depth_label }} |
-          | 📦 Clone size | ${{ steps.clone.outputs.clone_size }} |
-          | 🗄️ .git raw size | ${{ steps.clone.outputs.git_size }} |
-          | 🗜️ Format | \`${{ inputs.compress_format }}\` |
-          | 📉 Space saved | ${{ steps.compress.outputs.ratio }} |
-          | 📦 Archive size | ${{ steps.compress.outputs.archive_size }} |
-          | ✂️ Split | ${{ steps.split.outputs.split }} (${{ steps.split.outputs.part_count }} part(s)) |
-          | 🏷️ Tag | \`${{ steps.preflight.outputs.tag }}\` |
+          | 🔗 Repository | \`${REPO_URL}\` |
+          | 🌿 Branch | ${BRANCH_LABEL} |
+          | 🔢 Clone depth | ${DEPTH_LABEL} |
+          | 📦 Clone size | ${CLONE_SIZE} |
+          | 🗄️ .git raw size | ${GIT_SIZE} |
+          | 🗜️ Format | \`${FORMAT}\` |
+          | 📉 Space saved | ${RATIO} |
+          | 📦 Archive size | ${ARCHIVE_SIZE} |
+          | ✂️ Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
+          | 🏷️ Tag | \`${TAG}\` |
           | ▶️ Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
           EOF
 
@@ -437,7 +477,7 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
 
       - name: 🚀 Publish GitHub Release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@v1.21.0 # pinned: v1 is a moving tag, avoid mutable @v1 ref
         with:
           tag:                     "${{ steps.preflight.outputs.tag }}"
           name:                    "${{ steps.preflight.outputs.release_name }}"
