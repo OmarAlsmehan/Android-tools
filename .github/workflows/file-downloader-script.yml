@@ -100,10 +100,19 @@ jobs:
 
       - name: 🛫 Pre-flight — probe URL
         id: preflight
+        env:
+          URL: ${{ inputs.url }}
+          HEADER: ${{ inputs.extra_header }}
+          FILENAME_INPUT: ${{ inputs.filename }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           echo "::group::Pre-flight"
-          URL="${{ inputs.url }}"
-          HEADER="${{ inputs.extra_header }}"
+
+          # ── Mask the auth token so it never appears in plaintext in logs ────
+          if [[ -n "$HEADER" ]]; then
+            TOKEN_VALUE="${HEADER#*: }"
+            [[ -n "$TOKEN_VALUE" ]] && echo "::add-mask::$TOKEN_VALUE"
+          fi
 
           # ── Validate URL scheme ─────────────────────────────────────────────
           if [[ ! "$URL" =~ ^https?:// ]]; then
@@ -128,22 +137,31 @@ jobs:
           esac
 
           # ── Resolve filename ────────────────────────────────────────────────
-          if [[ -n "${{ inputs.filename }}" ]]; then
-            RAW_NAME="${{ inputs.filename }}"
+          if [[ -n "$FILENAME_INPUT" ]]; then
+            RAW_NAME="$FILENAME_INPUT"
           else
             RAW_NAME=$(echo "$CD_HEADER" \
               | sed -n "s/.*filename[^=]*=[[:space:]]*[\"']\?\([^\"';\r\n]*\).*/\1/Ip" \
               | tr -d '[:space:]')
             [[ -z "$RAW_NAME" ]] && RAW_NAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
-            [[ -z "$RAW_NAME" ]] && RAW_NAME="download_${{ github.run_number }}"
+            [[ -z "$RAW_NAME" ]] && RAW_NAME="download_${RUN_NUMBER}"
           fi
 
           SAFE_NAME=$(echo "$RAW_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
-          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="file_${{ github.run_number }}"
+          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="file_${RUN_NUMBER}"
 
           # ── Remote size ────────────────────────────────────────────────────
           if [[ -n "$CONTENT_LEN" && "$CONTENT_LEN" =~ ^[0-9]+$ ]]; then
             REMOTE_SIZE=$(numfmt --to=iec "$CONTENT_LEN")
+
+            # ── Disk-space guard — fail fast instead of after hours of transfer ──
+            AVAIL_BYTES=$(df --output=avail -B1 "$WORK_DIR" 2>/dev/null | tail -1)
+            # Require headroom for the raw file + a compressed copy + margin
+            NEEDED_BYTES=$(( CONTENT_LEN * 2 + 1073741824 ))
+            if [[ -n "$AVAIL_BYTES" && "$AVAIL_BYTES" -lt "$NEEDED_BYTES" ]]; then
+              echo "::error::Not enough runner disk space: need ~$(numfmt --to=iec $NEEDED_BYTES), have $(numfmt --to=iec $AVAIL_BYTES). Aborting before download."
+              exit 1
+            fi
           else
             REMOTE_SIZE="Unknown"
           fi
@@ -173,14 +191,23 @@ jobs:
 
       - name: 📥 Download file
         id: download
+        env:
+          URL: ${{ inputs.url }}
+          HEADER: ${{ inputs.extra_header }}
+          CONNECTIONS: ${{ inputs.connections }}
+          SAFE_NAME: ${{ steps.preflight.outputs.safe_name }}
         run: |
           echo "::group::Downloading"
-          SAFE_NAME="${{ steps.preflight.outputs.safe_name }}"
+          if [[ -n "$HEADER" ]]; then
+            TOKEN_VALUE="${HEADER#*: }"
+            [[ -n "$TOKEN_VALUE" ]] && echo "::add-mask::$TOKEN_VALUE"
+          fi
+
           OUTPUT="$WORK_DIR/$SAFE_NAME"
 
           ARIA_ARGS=(
-            "--split=${{ inputs.connections }}"
-            "--max-connection-per-server=${{ inputs.connections }}"
+            "--split=$CONNECTIONS"
+            "--max-connection-per-server=$CONNECTIONS"
             "--min-split-size=20M"
             "--piece-length=4M"
             "--max-tries=15"
@@ -199,11 +226,10 @@ jobs:
             "-d" "$WORK_DIR"
             "-o" "$SAFE_NAME"
           )
-          [[ -n "${{ inputs.extra_header }}" ]] && \
-            ARIA_ARGS+=("--header=${{ inputs.extra_header }}")
+          [[ -n "$HEADER" ]] && ARIA_ARGS+=("--header=$HEADER")
 
           START=$(date +%s)
-          aria2c "${ARIA_ARGS[@]}" "${{ inputs.url }}"
+          aria2c "${ARIA_ARGS[@]}" "$URL"
           ELAPSED=$(( $(date +%s) - START ))
 
           FILE_SIZE=$(stat -c%s "$OUTPUT")
@@ -231,10 +257,12 @@ jobs:
 
       - name: 🔐 Verify SHA256
         if: inputs.expected_checksum != ''
+        env:
+          OUTPUT: ${{ steps.download.outputs.output }}
+          EXPECTED_CHECKSUM: ${{ inputs.expected_checksum }}
         run: |
           echo "::group::Checksum verification"
-          OUTPUT="${{ steps.download.outputs.output }}"
-          EXPECTED=$(echo "${{ inputs.expected_checksum }}" \
+          EXPECTED=$(echo "$EXPECTED_CHECKSUM" \
             | tr '[:upper:]' '[:lower:]' | tr -d ' ')
           ACTUAL=$(sha256sum "$OUTPUT" | awk '{print $1}')
 
@@ -260,10 +288,11 @@ jobs:
 
       - name: 🗜️ Compress (if needed)
         id: compress
+        env:
+          OUTPUT: ${{ steps.download.outputs.output }}
+          FORMAT: ${{ inputs.compress_format }}
         run: |
           echo "::group::Compression"
-          OUTPUT="${{ steps.download.outputs.output }}"
-          FORMAT="${{ inputs.compress_format }}"
           FINAL_FILE="$OUTPUT"
           ACTION="skipped"
           RATIO="N/A"
@@ -292,7 +321,14 @@ jobs:
 
                 case "$FORMAT" in
                   zst)
-                    zstd -19 --threads=0 --rm "$OUTPUT" -o "${OUTPUT}.zst"
+                    # Level 19 is fine for small files but can be very slow past a
+                    # few GB — scale down as size grows to avoid eating the 360min budget.
+                    if   (( ORIG_BYTES > 5368709120 )); then ZSTD_LEVEL=9    # >5 GiB
+                    elif (( ORIG_BYTES > 1073741824 )); then ZSTD_LEVEL=15   # >1 GiB
+                    else ZSTD_LEVEL=19
+                    fi
+                    echo "→ zstd level: $ZSTD_LEVEL (based on $(numfmt --to=iec $ORIG_BYTES))"
+                    zstd "-$ZSTD_LEVEL" --threads=0 --rm "$OUTPUT" -o "${OUTPUT}.zst"
                     FINAL_FILE="${OUTPUT}.zst"
                     ;;
                   tar.gz)
@@ -337,12 +373,13 @@ jobs:
 
       - name: ✂️ Size check & split if needed
         id: split
+        env:
+          FINAL_FILE: ${{ steps.compress.outputs.final_file }}
+          FINAL_NAME: ${{ steps.compress.outputs.final_name }}
+          SPLIT_SIZE: ${{ inputs.split_size }}
         run: |
           echo "::group::Size check & split"
-          FINAL_FILE="${{ steps.compress.outputs.final_file }}"
-          FINAL_NAME="${{ steps.compress.outputs.final_name }}"
           FILE_BYTES=$(stat -c%s "$FINAL_FILE")
-          SPLIT_SIZE="${{ inputs.split_size }}"
           DID_SPLIT=false
           PART_COUNT=1
 
@@ -392,34 +429,51 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
 
       - name: 📝 Generate release notes
+        env:
+          FINAL_NAME: ${{ steps.compress.outputs.final_name }}
+          DID_SPLIT: ${{ steps.split.outputs.split }}
+          PART_COUNT: ${{ steps.split.outputs.part_count }}
+          RELEASE_NAME: ${{ steps.preflight.outputs.release_name }}
+          URL: ${{ inputs.url }}
+          RAW_NAME: ${{ steps.preflight.outputs.raw_name }}
+          REMOTE_SIZE: ${{ steps.preflight.outputs.remote_size }}
+          ACTUAL_SIZE: ${{ steps.download.outputs.actual_size }}
+          CONNECTIONS: ${{ inputs.connections }}
+          ELAPSED: ${{ steps.download.outputs.elapsed }}
+          AVG_SPEED: ${{ steps.download.outputs.avg_speed }}
+          MIME: ${{ steps.compress.outputs.mime }}
+          COMPRESS_ACTION: ${{ steps.compress.outputs.action }}
+          FINAL_SIZE: ${{ steps.compress.outputs.final_size }}
+          HAS_EXPECTED_CHECKSUM: ${{ inputs.expected_checksum != '' }}
         run: |
-          FINAL_NAME="${{ steps.compress.outputs.final_name }}"
-          DID_SPLIT="${{ steps.split.outputs.split }}"
-          PART_COUNT="${{ steps.split.outputs.part_count }}"
           CHECKSUMS=$(cat "$PARTS_DIR/SHA256SUMS.txt")
-          CHECKSUM_STATUS="${{ inputs.expected_checksum != '' && '✅ Verified' || '⏭️ Skipped' }}"
+          if [[ "$HAS_EXPECTED_CHECKSUM" == "true" ]]; then
+            CHECKSUM_STATUS="✅ Verified"
+          else
+            CHECKSUM_STATUS="⏭️ Skipped"
+          fi
 
           cat > release_notes.md << NOTES
-          ## ⬇️ ${{ steps.preflight.outputs.release_name }}
+          ## ⬇️ ${RELEASE_NAME}
 
           ### 🔗 Source
           | Field | Value |
           |-------|-------|
-          | URL | \`${{ inputs.url }}\` |
-          | Original filename | \`${{ steps.preflight.outputs.raw_name }}\` |
-          | Remote size | ${{ steps.preflight.outputs.remote_size }} |
-          | Downloaded size | ${{ steps.download.outputs.actual_size }} |
-          | Connections | ${{ inputs.connections }} |
-          | Download time | ${{ steps.download.outputs.elapsed }} |
-          | Avg speed | ${{ steps.download.outputs.avg_speed }} |
+          | URL | \`${URL}\` |
+          | Original filename | \`${RAW_NAME}\` |
+          | Remote size | ${REMOTE_SIZE} |
+          | Downloaded size | ${ACTUAL_SIZE} |
+          | Connections | ${CONNECTIONS} |
+          | Download time | ${ELAPSED} |
+          | Avg speed | ${AVG_SPEED} |
 
           ### ⚙️ Processing
           | Step | Result |
           |------|--------|
-          | MIME type | \`${{ steps.compress.outputs.mime }}\` |
+          | MIME type | \`${MIME}\` |
           | Checksum verify | ${CHECKSUM_STATUS} |
-          | Compression | ${{ steps.compress.outputs.action }} |
-          | Final size | ${{ steps.compress.outputs.final_size }} |
+          | Compression | ${COMPRESS_ACTION} |
+          | Final size | ${FINAL_SIZE} |
           | Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
 
           ### 🏗️ Build Info
@@ -461,21 +515,32 @@ jobs:
 
       - name: 📊 Write job summary
         if: always()
+        env:
+          URL: ${{ inputs.url }}
+          FINAL_NAME: ${{ steps.compress.outputs.final_name }}
+          MIME: ${{ steps.compress.outputs.mime }}
+          COMPRESS_ACTION: ${{ steps.compress.outputs.action }}
+          FINAL_SIZE: ${{ steps.compress.outputs.final_size }}
+          DID_SPLIT: ${{ steps.split.outputs.split }}
+          PART_COUNT: ${{ steps.split.outputs.part_count }}
+          ELAPSED: ${{ steps.download.outputs.elapsed }}
+          AVG_SPEED: ${{ steps.download.outputs.avg_speed }}
+          TAG: ${{ steps.preflight.outputs.tag }}
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## ⬇️ File Download & Release
 
           | Field | Value |
           |-------|-------|
-          | 🔗 URL | \`${{ inputs.url }}\` |
-          | 📁 File | \`${{ steps.compress.outputs.final_name }}\` |
-          | 🔍 MIME | \`${{ steps.compress.outputs.mime }}\` |
-          | ⚡ Compression | ${{ steps.compress.outputs.action }} |
-          | 📦 Final size | ${{ steps.compress.outputs.final_size }} |
-          | ✂️ Split | ${{ steps.split.outputs.split }} (${{ steps.split.outputs.part_count }} part(s)) |
-          | ⏱️ Time | ${{ steps.download.outputs.elapsed }} |
-          | 🚀 Speed | ${{ steps.download.outputs.avg_speed }} |
-          | 🏷️ Tag | \`${{ steps.preflight.outputs.tag }}\` |
+          | 🔗 URL | \`${URL}\` |
+          | 📁 File | \`${FINAL_NAME}\` |
+          | 🔍 MIME | \`${MIME}\` |
+          | ⚡ Compression | ${COMPRESS_ACTION} |
+          | 📦 Final size | ${FINAL_SIZE} |
+          | ✂️ Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
+          | ⏱️ Time | ${ELAPSED} |
+          | 🚀 Speed | ${AVG_SPEED} |
+          | 🏷️ Tag | \`${TAG}\` |
           | ▶️ Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
           EOF
 
@@ -484,7 +549,7 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
 
       - name: 🚀 Publish GitHub Release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@v1.21.0 # pinned: v1 is a moving tag, avoid mutable @v1 ref
         with:
           tag:                     "${{ steps.preflight.outputs.tag }}"
           name:                    "${{ steps.preflight.outputs.release_name }}"
